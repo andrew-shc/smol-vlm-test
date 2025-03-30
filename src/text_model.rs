@@ -4,6 +4,8 @@ use candle_core::{Device, Result, Tensor};
 use candle_nn::{ops, kv_cache::Cache, rotary_emb::rope, Embedding, Linear, Module, RmsNorm};
 use candle_core::DType;
 
+use crate::vision_model::SmolVision;
+
 
 
 const NUM_OF_HEADS: usize = 32;
@@ -198,8 +200,28 @@ impl Block {
 }
 
 
+pub struct Connector {
+    // scale_factor = 3
+    modality_proj: Linear,
+}
+
+impl Connector {
+    const SCALE_FACTOR: u32 = 3;
+
+    fn pixel_shuffle(&self) -> Result<Tensor> {
+        todo!()
+    }
+
+    pub fn forward(&self, image_hidden_states: &Tensor) -> Result<Tensor> {
+        todo!()
+    }
+}
+
+
 
 pub struct SmolVLM {
+    vision: SmolVision,
+    connector: Connector,
     embed: Embedding,
     blocks: Vec<Block>,
     norm: RmsNorm,
@@ -210,6 +232,8 @@ pub struct SmolVLM {
 impl SmolVLM {
     pub fn load(c: &HashMap<String, Tensor>, device: &Device) -> Result<Self> {
         Ok(Self {
+            vision: SmolVision::new(c, device)?,
+            connector: Connector { modality_proj: Linear::new(c["model.connector.modality_projection.proj.weight"].clone(), None) },
             embed: Embedding::new(c["model.text_model.embed_tokens.weight"].clone(), 2048),
             blocks: (0u8..=23).into_iter().map(|id| Block::load(c, id, device).unwrap()).collect(),
             norm: RmsNorm::new(c["model.text_model.norm.weight"].clone(), 1e-5),
@@ -217,13 +241,106 @@ impl SmolVLM {
         })
     }
 
+    fn inputs_merger(&self, image_token_mask: &Tensor, inputs_embeds: &Tensor, image_hidden_states: &Tensor) -> Result<Tensor> {
+
+    }
+
     pub fn forward(&self, xs: &Tensor, index_pos: usize) -> Result<Tensor> {
-        let mut x = self.embed.forward(xs)?;
+        /// pixel_value: &Tensor, pixel_attention_mask: &Tensor, 
+
+        let image_hidden_states = self.vision.forward(pixel_values, patch_attention_mask)?;
+        let image_hidden_states = self.connector.forward(&image_hidden_states)?;
+
+        let inputs_embeds = self.embed.forward(xs)?;
+        let x = self.inputs_merger(image_token_mask, &inputs_embeds, &image_hidden_states)?;
+
         for block in &self.blocks {
             x = block.forward(&x, index_pos)?;
         }
         let x = self.norm.forward(&x)?;
         let logits = self.lm_head.forward(&x)?;
         logits.to_dtype(DType::F32)
+    }
+}
+
+
+
+#[cfg(test)]
+mod tests {
+    use crate::vision_model::{get_prompt_split_image, load_image_url, preprocess_image, SmolVision};
+
+    use super::*; // Import functions from the outer scope
+    use hf_hub::api::sync::Api;
+
+    // Test case for the `add` function
+    #[test]
+    fn test_vision() -> Result<()> {
+        let device = Device::new_cuda(0)?;
+        
+        let api = Api::new().unwrap();
+        let repo = api.model("HuggingFaceTB/SmolVLM-Instruct".to_string());
+    
+        let weights = repo.get("model.safetensors").unwrap();
+        let weights = candle_core::safetensors::load(weights, &device)?;
+    
+        let model = SmolVision::new(&weights, &device)?;
+
+        /*
+            Assume we are given an option of at most one image (conditional execution of vision llm) placed at the beginning.
+         */
+
+        Ok(())
+    }
+
+    use image::GenericImageView;
+    use tokenizers::Tokenizer;
+
+    #[test]
+    fn test_preprocessing_images() -> Result<()> {
+        let device = Device::new_cuda(0)?;
+
+        println!("Loading image...");
+        let img = load_image_url(
+            "https://res.cloudinary.com/enchanting/q_70,f_auto,w_5472,h_3078,c_fit/exodus-web/2023/05/mont-blanc.jpg"
+        ).unwrap();
+
+        println!("[PRE] DIM: {:?}  FORMAT: {:?}", img.dimensions(), img.color());
+        let (img, mask, cols, rows) = preprocess_image(img, 1920, 384, &device);
+        println!("[POST] SHAPE: {:?} MAX: {:?} MIN: {:?} ", img.shape(), img.max_all(), img.min_all());
+        println!("[POST-MASK] SHAPE: {:?} MAX: {:?} MIN: {:?} ", mask.shape(), mask.max_all(), mask.min_all());
+
+        let img_token = get_prompt_split_image(81, rows, cols);
+
+        let sample_message = String::from("<|im_start|>
+User:<image>Where is this place?<end_of_utterance>
+Assistant:");
+
+        let sample_message = sample_message.replace("<image>", &img_token);
+        println!("Modified message: {:?} ", sample_message);
+        
+        /*
+        assuming this image is RGB with channel dimension as the first dimension (C,W,H).
+         - (padding) the produced image lists from splitting should have the same max_image_size
+            - strategy: pad beforehand + produce padding attention mask
+         - make sure its normalized (0-255 -> 0-1)
+         - further normalized by ImageNet's mean and std
+         - split
+
+        size                = 1920 (longest edge)
+        max_image_size      = 384 (longest edge)
+
+                resample            = LANCZOS
+            resize_for_vision_encoder (in multiple of max_image_size)
+        do_image_splitting  = true
+         */
+
+        let mut tokenizer = Tokenizer::from_pretrained("HuggingFaceTB/SmolVLM-Instruct", None).unwrap();
+        let encoding = tokenizer.encode(sample_message.clone(), false).unwrap();
+        let tokens = encoding.get_tokens();
+
+        println!("{:?}", tokens);
+
+
+        Ok(())
     }
 }
