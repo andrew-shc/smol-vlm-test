@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use candle_core::{Device, Result, Tensor};
+use candle_core::{Device, IndexOp, Result, Tensor};
 use candle_nn::{ops, kv_cache::Cache, rotary_emb::rope, Embedding, Linear, Module, RmsNorm};
 use candle_core::DType;
 
@@ -174,7 +174,7 @@ impl Block {
     fn load(c: &HashMap<String, Tensor>, id: u8, device: &Device) -> Result<Self> {
         let val = |k| c[&("model.text_model.layers.".to_owned()+&id.to_string()+"."+k+".weight")].clone();
 
-        println!("Loaded layer: {:?}", id);
+        println!("Loaded layer (LM): {:?}", id);
 
         Ok(Self {
             input_layer_norm: RmsNorm::new(val("input_layernorm"), 1e-5),
@@ -206,14 +206,24 @@ pub struct Connector {
 }
 
 impl Connector {
-    const SCALE_FACTOR: u32 = 3;
+    const SCALE_FACTOR: usize = 3;
+    const HEIGHT: usize = 27;
+    const WIDTH: usize = 27;
 
-    fn pixel_shuffle(&self) -> Result<Tensor> {
-        todo!()
+    fn pixel_shuffle(&self, x: &Tensor) -> Result<Tensor> {
+        let (batch, patches, embed_dim) = x.dims3()?;  // patches == HEIGHT*WIDTH
+
+        x   .reshape(&[batch, Self::HEIGHT, Self::WIDTH, embed_dim])?
+            .reshape(&[batch, Self::HEIGHT, Self::WIDTH/Self::SCALE_FACTOR, embed_dim*Self::SCALE_FACTOR])?
+            .permute([0, 2, 1, 3])?
+            .reshape(&[batch, Self::WIDTH/Self::SCALE_FACTOR, Self::HEIGHT/Self::SCALE_FACTOR, embed_dim*Self::SCALE_FACTOR*Self::SCALE_FACTOR])?
+            .permute([0, 2, 1, 3])?
+            .reshape(&[batch, patches/(Self::SCALE_FACTOR*Self::SCALE_FACTOR), embed_dim*Self::SCALE_FACTOR*Self::SCALE_FACTOR])
     }
 
     pub fn forward(&self, image_hidden_states: &Tensor) -> Result<Tensor> {
-        todo!()
+        let image_hidden_states = self.pixel_shuffle(image_hidden_states)?;
+        self.modality_proj.forward(&image_hidden_states)
     }
 }
 
@@ -230,9 +240,11 @@ pub struct SmolVLM {
 
 
 impl SmolVLM {
+    const BLOCKS_PER_SAMPLE: u32 = 81;
+
     pub fn load(c: &HashMap<String, Tensor>, device: &Device) -> Result<Self> {
         Ok(Self {
-            vision: SmolVision::new(c, device)?,
+            vision: SmolVision::load(c, device)?,
             connector: Connector { modality_proj: Linear::new(c["model.connector.modality_projection.proj.weight"].clone(), None) },
             embed: Embedding::new(c["model.text_model.embed_tokens.weight"].clone(), 2048),
             blocks: (0u8..=23).into_iter().map(|id| Block::load(c, id, device).unwrap()).collect(),
@@ -241,18 +253,89 @@ impl SmolVLM {
         })
     }
 
-    fn inputs_merger(&self, image_token_mask: &Tensor, inputs_embeds: &Tensor, image_hidden_states: &Tensor) -> Result<Tensor> {
+    fn inputs_merger(&self, image_token_mask: &Tensor, inputs_embeds: &Tensor, image_hidden_states: &Tensor, device: &Device) -> Result<Tensor> {
+        let total_length = image_token_mask.dims1()?;
+        let (patches, patch_size, hidden_dim) = image_hidden_states.dims3()?;
 
+        // println!("Image tokens: {:?}", image_token_mask.to_dtype(DType::U32)?.sum_all()?);
+        // println!("Patch sequences: {:?}", patches*81);
+        // println!("Img tkn mask: {:?}", image_token_mask);
+        // println!("Inp embeds: {:?}", inputs_embeds);
+        // println!("Img hidden: {:?}", image_hidden_states);
+
+        // let scatter_indices = {
+
+        //     let indices = Tensor::arange(0u32, total_length as u32, device)?
+        //         .mul(&image_token_mask.to_dtype(DType::U32)?)?;
+        //     let scatter_indices = indices
+        //         .to_vec1::<u32>()?
+        //         .into_iter()
+        //         .filter(|&x| x != 0)
+        //         .collect::<Vec<u32>>();
+
+        //     Tensor::from_vec(scatter_indices, patches*81, device)
+        // }?;
+
+        // println!("Img embed assign: {:?}", scatter_indices);
+        // println!("Img embed assign: {:?}", scatter_indices.to_vec1::<u32>());
+
+        // let image_embeds = inputs_embeds.zeros_like()?
+        //     .scatter_add(&scatter_indices.unsqueeze(1)?, &image_hidden_states.flatten(0, 1)?, 0)?;
+        
+        // println!("Img embed assign: {:?}", image_embeds);
+
+        let image_hidden_states = image_hidden_states.flatten(0, 1)?;
+
+        let mut merged_embeds = Vec::with_capacity(total_length);
+        let mut c = 0;
+        for (i, mask) in image_token_mask.to_vec1::<u8>()?.into_iter().enumerate() {
+            merged_embeds.push(if mask != 0 {
+                c += 1;
+                image_hidden_states.i(c-1)?
+            } else {
+                inputs_embeds.i(i)?
+            });
+        }
+
+        // let merged_embeds = Tensor::from_vec(merged_embeds, (total_length, hidden_dim), device)?;
+        let merged_embeds = Tensor::stack(&merged_embeds, 0)?;
+
+        Ok(merged_embeds)
+
+        // let indices = Tensor::arange(0u32, total_length as u32, device)?
+        //     .mul(&image_token_mask.to_dtype(DType::U32)?)?;
+        // let scatter_indices = indices
+        //     .to_vec1::<u32>()?
+        //     .into_iter()
+        //     .filter(|&x| x != 0)
+        //     .collect::<Vec<u32>>();
+
+        // todo!();
+
+        // image_token_mask.where_cond(&image_embeds, inputs_embeds)
     }
 
-    pub fn forward(&self, xs: &Tensor, index_pos: usize) -> Result<Tensor> {
-        /// pixel_value: &Tensor, pixel_attention_mask: &Tensor, 
+    pub fn forward(
+        &self, xs: &Tensor, index_pos: usize, vision_data: Option<(Tensor, &Tensor, &Tensor)>, device: &Device
+    ) -> Result<Tensor> {
+        let mut inputs_embeds = self.embed.forward(xs)?;
 
-        let image_hidden_states = self.vision.forward(pixel_values, patch_attention_mask)?;
-        let image_hidden_states = self.connector.forward(&image_hidden_states)?;
+        if let Some((image_token_mask, pixel_values, pixel_attention_masks)) = vision_data {
+            println!("Vision...");
+            let image_hidden_states = self.vision.forward(pixel_values, pixel_attention_masks, device)?;
+            let image_hidden_states = self.connector.forward(&image_hidden_states)?;
+    
+            inputs_embeds = self.inputs_merger(
+                &image_token_mask, 
+                &inputs_embeds,
+                &image_hidden_states,
+                device
+            )?;
+        }
 
-        let inputs_embeds = self.embed.forward(xs)?;
-        let x = self.inputs_merger(image_token_mask, &inputs_embeds, &image_hidden_states)?;
+        println!("Language...");
+
+        let mut x = inputs_embeds; //self.inputs_merger(image_token_mask, &inputs_embeds, &image_hidden_states)?;
 
         for block in &self.blocks {
             x = block.forward(&x, index_pos)?;
@@ -271,8 +354,66 @@ mod tests {
 
     use super::*; // Import functions from the outer scope
     use hf_hub::api::sync::Api;
+    use image::GenericImageView;
+    use tokenizers::Tokenizer;
+    use candle_core::Shape;
 
-    // Test case for the `add` function
+    #[test]
+    fn test_multimodal() -> Result<()> {
+        let device = Device::new_cuda(0)?;
+        let mut tokenizer = Tokenizer::from_pretrained("HuggingFaceTB/SmolVLM-Instruct", None).unwrap();
+        let api = Api::new().unwrap();
+        let repo = api.model("HuggingFaceTB/SmolVLM-Instruct".to_string());
+        let weights = repo.get("model.safetensors").unwrap();
+        let weights = candle_core::safetensors::load(weights, &device)?;
+        
+        let model = SmolVLM::load(&weights, &device)?;
+
+
+        if let Ok(img) = load_image_url(
+            "https://res.cloudinary.com/enchanting/q_70,f_auto,w_5472,h_3078,c_fit/exodus-web/2023/05/mont-blanc.jpg"
+        ) {
+            let (img, mask, cols, rows) = preprocess_image(img, 1920, 384, &device);
+            let img_token = get_prompt_split_image(81, rows, cols);
+    
+            let sample_message = String::from("<|im_start|>
+    User:<image>Where is this place?<end_of_utterance>
+    Assistant:");
+            let sample_message = sample_message.replace("<image>", &img_token);
+    
+            let tokens_enc = tokenizer.encode(sample_message.clone(), false).unwrap();
+            let tokens = tokens_enc.get_ids();
+            let image_token_enc = tokenizer.encode("<image>", false).unwrap();
+            let image_token = image_token_enc.get_ids();
+    
+            let input = Tensor::from_slice(tokens, &[tokens.len()], &device)?;
+            let image_token_mask = Tensor::from_slice(image_token, &[1], &device)?;
+            let image_token_mask = input.broadcast_eq(&image_token_mask)?;
+    
+            // println!("{:?}", input);
+            // println!("{:?}", image_token_mask);
+            // println!("{:?}", image_token_mask.to_dtype(DType::U32)?.sum_all()?);
+            let logits = model.forward(&input, 0, Some((&image_token_mask, &img, &mask)), &device)?;    
+        } else {
+            println!("Invalid or empty URL (no image)");
+
+            let sample_message = String::from("<|im_start|>
+    User:Where is this place?<end_of_utterance>
+    Assistant:");
+            let tokens_enc = tokenizer.encode(sample_message.clone(), false).unwrap();
+            let tokens = tokens_enc.get_ids();
+    
+            let input = Tensor::from_slice(tokens, &[tokens.len()], &device)?;
+    
+            // println!("{:?}", input);
+            // println!("{:?}", image_token_mask);
+            // println!("{:?}", image_token_mask.to_dtype(DType::U32)?.sum_all()?);
+            let logits = model.forward(&input, 0, None, &device)?;    
+        }
+        
+        Ok(())
+    }
+
     #[test]
     fn test_vision() -> Result<()> {
         let device = Device::new_cuda(0)?;
@@ -283,17 +424,22 @@ mod tests {
         let weights = repo.get("model.safetensors").unwrap();
         let weights = candle_core::safetensors::load(weights, &device)?;
     
-        let model = SmolVision::new(&weights, &device)?;
+        let model = SmolVision::load(&weights, &device)?;
 
         /*
             Assume we are given an option of at most one image (conditional execution of vision llm) placed at the beginning.
          */
 
+        let img = load_image_url(
+            "https://res.cloudinary.com/enchanting/q_70,f_auto,w_5472,h_3078,c_fit/exodus-web/2023/05/mont-blanc.jpg"
+        ).unwrap();
+        let (img, mask, cols, rows) = preprocess_image(img, 1920, 384, &device);
+        let img_token = get_prompt_split_image(81, rows, cols);
+
+        model.forward(&img, &mask, &device)?;
+
         Ok(())
     }
-
-    use image::GenericImageView;
-    use tokenizers::Tokenizer;
 
     #[test]
     fn test_preprocessing_images() -> Result<()> {

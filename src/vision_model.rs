@@ -3,12 +3,9 @@
 
 
 use std::{collections::HashMap, error::Error};
-
-use candle_core::shape::Dim;
-use candle_nn::{Conv2d, Conv2dConfig, Embedding, LayerNorm, Linear, Module, RmsNorm};
-use candle_core::{DType, Device, Result, Shape, Tensor};
-use image::ImageBuffer;
-use image::{imageops::FilterType, io::Reader as ImageReader, DynamicImage, GenericImage, GenericImageView, GrayImage, Luma, Pixel, Rgb, RgbImage, Rgba};
+use candle_nn::{Conv2d, Conv2dConfig, Embedding, LayerNorm, Linear, Module};
+use candle_core::{DType, Device, Result, Shape, Tensor, D};
+use image::{imageops::FilterType, io::Reader as ImageReader, DynamicImage, GenericImage, GenericImageView, GrayImage, Luma, Rgb, RgbImage};
 use reqwest;
 use std::path::Path;
 use std::io::Cursor;
@@ -26,7 +23,7 @@ const STD: [f32; 3] = [0.229, 0.224, 0.225];
 pub fn load_image_url(url: &str) -> std::result::Result<DynamicImage, Box<dyn Error>> {
     // Generate a file name based on the URL (you can customize this to your needs)
     let file_name = {
-        let parsed_url = reqwest::Url::parse(url).expect("Invalid URL");
+        let parsed_url = reqwest::Url::parse(url)?;
         let path = parsed_url.path();
         
         // Extract the last part of the URL (the file name)
@@ -75,9 +72,24 @@ pub fn preprocess_image(
         let longest_edge = width.max(height);
 
         if longest_edge <= max_size {
-            img
+            img.clone()
         } else {
             let scale_factor = max_size as f32 / longest_edge as f32;
+        
+            let new_width = (width as f32 * scale_factor) as u32;
+            let new_height = (height as f32 * scale_factor) as u32;
+    
+            img.resize(new_width, new_height, FilterType::Lanczos3)
+        }
+    };
+    let global_img = {
+        let (width, height) = img.dimensions();
+        let longest_edge = width.max(height);
+
+        if longest_edge <= outer_patch_size {
+            img.clone()
+        } else {
+            let scale_factor = outer_patch_size as f32 / longest_edge as f32;
         
             let new_width = (width as f32 * scale_factor) as u32;
             let new_height = (height as f32 * scale_factor) as u32;
@@ -102,9 +114,27 @@ pub fn preprocess_image(
 
         (padded_img, padded_mask)
     };
+    let (global_img, global_mask) = {
+        let (width, height) = global_img.dimensions();
+        let mask = GrayImage::from_pixel(width, height, Luma([255]));
+
+        let new_width = u32::div_ceil(width, outer_patch_size)*outer_patch_size;
+        let new_height = u32::div_ceil(height, outer_patch_size)*outer_patch_size;
+    
+        // Create a new blank image for padding
+        let mut padded_img = RgbImage::from_pixel(new_width, new_height, Rgb([0, 0, 0]));
+        padded_img.copy_from(&global_img.to_rgb8(), 0, 0).unwrap();
+        let mut padded_mask = GrayImage::from_pixel(new_width, new_height, Luma([0]));
+        padded_mask.copy_from(&mask, 0, 0).unwrap();
+
+        (padded_img, padded_mask)
+    };
+
 
     img.save("padded_img.png").unwrap();
     mask.save("mask.png").unwrap();
+    global_img.save("global_padded_img.png").unwrap();
+    global_mask.save("global_mask.png").unwrap();
 
     let img = {
         let (width, height) = img.dimensions();
@@ -125,6 +155,25 @@ pub fn preprocess_image(
         ).unwrap()
             .to_dtype(candle_core::DType::F32).unwrap()
     };
+    let global_img = {
+        let (width, height) = global_img.dimensions();
+        let img_data: Vec<u8> = global_img.pixels().flat_map(|p| p.0.iter().copied()).collect();
+
+        Tensor::from_vec(
+            img_data, Shape::from_dims(&[height as usize, width as usize, 3]), device
+        ).unwrap()
+            .permute(vec![2, 0, 1]).unwrap()
+            .to_dtype(candle_core::DType::F32).unwrap()
+    };
+    let global_mask = {
+        let (width, height) = global_mask.dimensions();
+        let img_data: Vec<u8> = global_mask.pixels().flat_map(|p| p.0.iter().copied()).collect();
+
+        Tensor::from_vec(
+            img_data, Shape::from_dims(&[height as usize, width as usize]), device
+        ).unwrap()
+            .to_dtype(candle_core::DType::F32).unwrap()
+    };
 
 
     // rescaling and normalizing
@@ -138,27 +187,44 @@ pub fn preprocess_image(
 
         img
     };
+    let global_img = {
+        let mut global_img = (global_img / 255.0).unwrap();
+        let m = Tensor::from_slice(&MEAN, (3,1,1), device).unwrap();
+        let s = Tensor::from_slice(&STD, (3,1,1), device).unwrap();
+
+        global_img = global_img.broadcast_sub(&m).unwrap();
+        global_img = global_img.broadcast_div(&s).unwrap();
+
+        global_img
+    };
 
     let (c, h, w) = img.dims3().unwrap();
     let cols = w / outer_patch_size as usize;
     let rows = h / outer_patch_size as usize;
 
     // splitting
-    let img = {
+    let img_patches = {
         img
+            .unsqueeze(2).unwrap()
+            .unsqueeze(4).unwrap()
             .reshape(&[c, rows, outer_patch_size as usize, cols, outer_patch_size as usize]).unwrap()
             .permute([1, 3, 0, 2, 4]).unwrap()
             .reshape(&[rows*cols, c, outer_patch_size as usize, outer_patch_size as usize]).unwrap()
     };
-    let mask = {
+    let mask_patches = {
         mask
+            .unsqueeze(1).unwrap()
+            .unsqueeze(3).unwrap()
             .reshape(&[rows, outer_patch_size as usize, cols, outer_patch_size as usize]).unwrap()
             .permute([0, 2, 1, 3]).unwrap()
             .reshape(&[rows*cols, outer_patch_size as usize, outer_patch_size as usize]).unwrap()
     };
-    
 
-    (img, mask, cols, rows)
+    // concatenating global image
+    let img_patches = Tensor::cat(&[&img_patches, &global_img.unsqueeze(0).unwrap()], 0).unwrap();
+    let mask_patches = Tensor::cat(&[&mask_patches, &global_mask.unsqueeze(0).unwrap()], 0).unwrap();
+
+    (img_patches, mask_patches, cols, rows)
 }
 
 pub fn get_prompt_split_image(
@@ -194,40 +260,33 @@ struct Attention {
 }
 
 impl Attention {
-    fn new(q: Tensor, k: Tensor, v: Tensor, o: Tensor, device: &Device) -> Result<Self> {
-        let theta = Tensor::new(calculate_default_inv_freq(), device)?;
-        // 0 -> max position embedding
-        let idx_theta = Tensor::arange(0, 16384u32, device)?
-            .to_dtype(DType::F32)?
-            .reshape((16384, 1))?
-            .matmul(&theta.reshape((1, theta.elem_count()))?)?;
-
-        Ok(Self {
-            q_proj: Linear::new(q, None),
-            k_proj: Linear::new(k, None),
-            v_proj: Linear::new(v, None),
-            o_proj: Linear::new(o, None),
-        })
-    }
+    // fn new(q: Tensor, k: Tensor, v: Tensor, o: Tensor, device: &Device) -> Result<Self> {
+    //     Ok(Self {
+    //         q_proj: Linear::new(q, None),
+    //         k_proj: Linear::new(k, None),
+    //         v_proj: Linear::new(v, None),
+    //         o_proj: Linear::new(o, None),
+    //     })
+    // }
 
     fn forward(&self, x: &Tensor, attention_mask: &Tensor) -> Result<Tensor> {
-        let (seq_len, hidden_size) = x.dims2()?;
+        let (batches, patches, hidden_size) = x.dims3()?;
 
         let q = self.q_proj.forward(x)?;
         let k = self.k_proj.forward(x)?;
         let v = self.v_proj.forward(x)?;
 
         let q = q
-            .reshape((seq_len, NUM_OF_HEADS, HEAD_DIM))?
-            .transpose(0, 1)?
+            .reshape((batches, patches, NUM_OF_HEADS, HEAD_DIM))?
+            .transpose(1, 2)?
             .contiguous()?;
         let k = k
-            .reshape((seq_len, NUM_OF_HEADS, HEAD_DIM))?
-            .transpose(0, 1)?
+            .reshape((batches, patches, NUM_OF_HEADS, HEAD_DIM))?
+            .transpose(1, 2)?
             .contiguous()?;
         let v = v
-            .reshape((seq_len, NUM_OF_HEADS, HEAD_DIM))?
-            .transpose(0, 1)?;
+            .reshape((batches, patches, NUM_OF_HEADS, HEAD_DIM))?
+            .transpose(1, 2)?;
 
         let y =
         // if false {
@@ -235,7 +294,7 @@ impl Attention {
         //     let k = k.transpose(1, 2)?;
         //     let v = v.transpose(1, 2)?;
         //     let softmax_scale = 1f32 / (HEAD_DIM as f32).sqrt();
-        //     flash_attn(&q, &k, &v, softmax_scale, seq_len > 1)?.transpose(1, 2)?.into()
+        //     flash_attn(&q, &k, &v, softmax_scale, batches > 1)?.transpose(1, 2)?.into()
         // } else
         {
             let in_dtype = q.dtype();
@@ -244,13 +303,14 @@ impl Attention {
             let v = v.to_dtype(DType::F32)?;
     
             let att = (q.matmul(&k.t()?)? / (HEAD_DIM as f64).sqrt())?;
+            let att = att.broadcast_add(attention_mask)?;
     
             // println!("{:?}", att.shape());
     
             let att = candle_nn::ops::softmax_last_dim(&att)?;
             att.matmul(&v)?.contiguous()?.to_dtype(in_dtype)?
         };
-        let y = y.transpose(0, 1)?.reshape(&[seq_len, hidden_size])?;
+        let y = y.transpose(0, 1)?.reshape(&[batches, patches, hidden_size])?;
         self.o_proj.forward(&y)
     }
 }
@@ -268,7 +328,7 @@ impl MLP {
     // }
 
     pub fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        let x = self.fc1.forward(xs)?.gelu();  // python impl. uses gelo approximated with tanh
+        let x = self.fc1.forward(xs)?.gelu()?;  // python impl. uses gelo approximated with tanh
         self.fc2.forward(&x)
     }
 }
@@ -286,6 +346,8 @@ impl Block {
     pub fn new(c: &HashMap<String, Tensor>, id: u8, device: &Device) -> Result<Self> {
         let w = |k| c[&("model.vision_model.encoder.layers.".to_owned()+&id.to_string()+"."+k+".weight")].clone();
         let b = |k| c[&("model.vision_model.encoder.layers.".to_owned()+&id.to_string()+"."+k+".bias")].clone();
+
+        println!("Loaded layer (VT): {:?}", id);
 
         Ok(Self {
             self_attn: Attention {
@@ -324,7 +386,9 @@ pub struct SmolVision {
 }
 
 impl SmolVision {
-    pub fn new(c: &HashMap<String, Tensor>, device: &Device) -> Result<Self> {
+    const SUB_PATCH_SIZE: usize = 14;
+
+    pub fn load(c: &HashMap<String, Tensor>, device: &Device) -> Result<Self> {
         Ok(Self {
             patch_embedding: Conv2d::new(
                 c["model.vision_model.embeddings.patch_embedding.weight"].clone(),
@@ -343,14 +407,66 @@ impl SmolVision {
         })
     }
 
-    pub fn forward(&self, pixel_values: &Tensor, patch_attention_mask: &Tensor) -> Result<Tensor> {
-        let x = {
-            Tensor::new(array, device)  // TODO
-        }?;  // size of 1152
+    pub fn forward(&self, pixel_values: &Tensor, pixel_attention_masks: &Tensor, device: &Device) -> Result<Tensor> {
+        // B = patch rows x patch cols (x number of images)
+        // pixel_values: B x 3 x PatchHeight x PatchWidth
+        // pixel_attention_masks: B x PatchHeight x PatchWidth
+        let (batch, patch_h, patch_w) = pixel_attention_masks.dims3()?;
+
+        // the unfold operation (splitting patches into 27x27 subpatches of 14x14 pixels)
+        // 384x384 -> 378x378 where 378=14*27 (divisible by 14)
+        // truncate around the middle
+        let truncated = pixel_attention_masks.narrow(1, 3, patch_h-3*2)?.narrow(2, 3, patch_w-3*2)?;
+        let patch_attention_masks = truncated
+            .unsqueeze(2)?
+            .unsqueeze(4)?
+            .reshape(&[batch, patch_h / Self::SUB_PATCH_SIZE, Self::SUB_PATCH_SIZE, patch_w / Self::SUB_PATCH_SIZE, Self::SUB_PATCH_SIZE])?
+            .permute([0, 1, 3, 2, 4])?
+            .sum_keepdim([3,4])?
+            .squeeze(4)?
+            .squeeze(3)?
+            .gt(0.0)?
+            .reshape(&[batch, 27*27])?
+            .contiguous()?
+            .to_dtype(DType::U32)?;
+        // patch_attention_masks: B x PatchRows x PatchCols x 196
+
+        // println!("{:?}", truncated.shape());
+        // println!("{:?}", patch_attention_masks);
+        // println!("{:?}", patch_attention_masks.to_vec3::<u8>());
+
+        let mut hidden_states = {
+            let patch_embeddings = self.patch_embedding.forward(&pixel_values.to_dtype(DType::BF16)?)?;
+            // println!("{:?}", patch_embeddings.shape());
+            let patch_embeddings = patch_embeddings.flatten_from(2)?.transpose(1, 2)?;
+            // println!("{:?}", patch_embeddings.shape());
+    
+    
+            let position_ids = {
+                let raw_ids = Tensor::arange(0u32, 27*27, device)?
+                    .expand(&[batch, 27*27])?;
+                (raw_ids * &patch_attention_masks)?
+            };
+            let position_embeddings = self.position_embedding.forward(&position_ids)?;
+            patch_embeddings+position_embeddings
+        }?;
+        // println!(">> {:?}", hidden_states);
+
+        let patch_attention_masks = {
+            let expanded_masks = patch_attention_masks
+                .unsqueeze(1)?
+                .unsqueeze(1)?
+                .expand(&[batch, 1, 27*27, 27*27])?;  // batch, head_dim, subpatches, subpatches
+            let inverted_mask = Tensor::ones_like(&expanded_masks)?
+                .sub(&expanded_masks)?;
+            let neg_infs = Tensor::full(f32::NEG_INFINITY, inverted_mask.shape(), device)?;
+            inverted_mask.where_cond(&neg_infs, &inverted_mask.to_dtype(DType::F32)?)?
+        };
+        // println!(">> {:?}", patch_attention_masks);
 
         for block in &self.blocks {
-            x = block.forward(&x, patch_attention_mask)?;
+            hidden_states = block.forward(&hidden_states, &patch_attention_masks)?;
         }
-        self.post_layernorm.forward(xs)
+        self.post_layernorm.forward(&hidden_states)
     }
 }

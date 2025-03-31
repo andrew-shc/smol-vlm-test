@@ -2,8 +2,18 @@
 
 Just testing SmolVLM in Rust via Candle and tokenizer.
 
-Currently it has a working text interface (maybe not the current commit). Looking to finalize integrating the vision transformer.
-After that, might try to see how well it works with robotics and real-time processing of images.
+Currently it has a working text interface (maybe not the current commit).
+
+## How to use
+`img> ` Paste in a URL. If invalid or empty, it will first say which and will continue as if there were no images.
+`txt> ` Text prompt.
+
+
+## Short-term goals
+- Add KV Caching
+- Experiment with real-time image processing (read images and undestand each frame)
+- (Maybe) multiple images and interleaving images
+
 
 # Learning Experience
 
