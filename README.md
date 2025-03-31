@@ -1,6 +1,6 @@
 # SmolVLM Test
 
-Just testing SmolVLM in Rust via Candle and tokenizer.
+Working custom implementation of SmolVLM in Rust via Candle and tokenizer.
 
 It has a working text and image interface via CLI. Currently, it only takes in at most one image mostly as a proof of concept for Rust implementation.
 
@@ -17,9 +17,9 @@ With SmolVLM's emphasis on OCR, it is quite good in retrieving the small texts a
 
 
 ## Short-term goals
--[ ] Add KV Caching for faster inference speed
--[ ] Experiment with real-time image processing (interpreting images and undestand each frame)
--[ ] (Maybe) multiple images and interleaving images
+- [ ] Add KV Caching for faster inference speed
+- [ ] Experiment with real-time image processing (interpreting images and undestand each frame) in the context of robotics
+- [ ] (Maybe) multiple images and interleaving images
 
 ## Rust
 1. I think it shows implementing LLMs are feasible with `candle`, since it provided a lot of useful basic tensor operations. (Almost 1-1 to PyTorch)
@@ -53,3 +53,9 @@ Sometimes when I ask SmolVLM to describe the image, it goes on multiple lines ta
     - LLMs are given a Jinja template to structure the raw message input with special tokens. Before, I did not realize all this was happening
     within Python's `transformer` library.
     - LLMs are really *really* just bunch of math operations. After implementing my first LLM in Rust (SmolVLM), it changes how you see LLM now that you know how each math operation works under the hood. They're just a bunch of embedding transformations (things you use in vector databases), layer norms (similiar to batch norms), and transformers (i.e., scaled dot products (and also MLPs))
+
+# Reference
+- [`candle`](https://github.com/huggingface/candle/blob/main/candle-transformers/src/models/llama.rs)'s Rust implementation of llama (which is what SmolVLM's text model is based off of)
+- [`transformers`](https://github.com/huggingface/transformers/tree/348f3285c5114159d2ff4933b4b8ae36866d01a7/src/transformers/models/smolvlm) library (Python)
+- So far the only major pure Rust implementation of SmolVLM. [Mistral.rs](https://github.com/EricLBuehler/mistral.rs/tree/master/mistralrs-core/src/vision_models/idefics3)
+
