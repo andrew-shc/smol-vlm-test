@@ -64,8 +64,8 @@ impl Attention {
 
         rope(
             &x.unsqueeze(0)?,
-            &self.cos.narrow(0, index_pos, seq_len)?,
-            &self.sin.narrow(0, index_pos, seq_len)?
+            &self.cos.narrow(0, index_pos, seq_len).expect("Exceeded context limit"),
+            &self.sin.narrow(0, index_pos, seq_len).expect("Exceeded context limit")
         )?.squeeze(0)
     }
 
@@ -236,6 +236,8 @@ pub struct SmolVLM {
     blocks: Vec<Block>,
     norm: RmsNorm,
     lm_head: Linear,
+
+    image_hidden_states: Option<Tensor>,
 }
 
 
@@ -249,7 +251,9 @@ impl SmolVLM {
             embed: Embedding::new(c["model.text_model.embed_tokens.weight"].clone(), 2048),
             blocks: (0u8..=23).into_iter().map(|id| Block::load(c, id, device).unwrap()).collect(),
             norm: RmsNorm::new(c["model.text_model.norm.weight"].clone(), 1e-5),
-            lm_head: Linear::new(c["lm_head.weight"].clone(), None)
+            lm_head: Linear::new(c["lm_head.weight"].clone(), None),
+
+            image_hidden_states: None,
         })
     }
 
@@ -305,14 +309,21 @@ impl SmolVLM {
     }
 
     pub fn forward(
-        &self, xs: &Tensor, index_pos: usize, vision_data: Option<(Tensor, &Tensor, &Tensor)>, device: &Device
+        &mut self, xs: &Tensor, index_pos: usize, vision_data: Option<(Tensor, &Tensor, &Tensor)>, device: &Device
     ) -> Result<Tensor> {
         let mut inputs_embeds = self.embed.forward(xs)?;
 
         if let Some((image_token_mask, pixel_values, pixel_attention_masks)) = vision_data {
             // println!("Vision...");
-            let image_hidden_states = self.vision.forward(pixel_values, pixel_attention_masks, device)?;
-            let image_hidden_states = self.connector.forward(&image_hidden_states)?;
+            // TODO: this assumes there will be at most one new images added
+            let image_hidden_states = if let Some(ref image_hidden_states) = self.image_hidden_states {
+                image_hidden_states
+            } else {
+                let image_hidden_states = self.vision.forward(pixel_values, pixel_attention_masks, device)?;
+                let image_hidden_states = self.connector.forward(&image_hidden_states)?;
+                self.image_hidden_states = Some(image_hidden_states);
+                self.image_hidden_states.as_ref().unwrap()
+            };
     
             inputs_embeds = self.inputs_merger(
                 &image_token_mask, 
@@ -356,7 +367,7 @@ mod tests {
         let weights = repo.get("model.safetensors").unwrap();
         let weights = candle_core::safetensors::load(weights, &device)?;
         
-        let model = SmolVLM::load(&weights, &device)?;
+        let mut model = SmolVLM::load(&weights, &device)?;
 
 
         if let Ok(img) = load_image_url(

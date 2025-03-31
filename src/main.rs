@@ -72,7 +72,7 @@ fn main() -> Result<()> {
     //     }
     // )).unwrap();
 
-    let model = text_model::SmolVLM::load(&weights, &device)?;
+    let mut model = text_model::SmolVLM::load(&weights, &device)?;
 
     let image_token_enc = tokenizer.encode("<image>", false).unwrap();
     let image_token = image_token_enc.get_ids();
@@ -112,8 +112,8 @@ fn main() -> Result<()> {
     let mut lines_printed = 0;
     for i in 0..10_000 {
         if i == 0 || output == "<end_of_utterance>" {
-            let img_url = String::from("https://res.cloudinary.com/enchanting/q_70,f_auto,w_5472,h_3078,c_fit/exodus-web/2023/05/mont-blanc.jpg");
-            // let img_url = read_input("img> ");
+            // let img_url = String::from("https://res.cloudinary.com/enchanting/q_70,f_auto,w_5472,h_3078,c_fit/exodus-web/2023/05/mont-blanc.jpg");
+            let img_url = read_input("img> ");
             let img = load_image_url(&img_url)
                 .and_then(
                     |v| if image.len() > 1 {
@@ -130,6 +130,7 @@ fn main() -> Result<()> {
                 txt_prompt = txt_prompt.replace("<image>", &img_token);
             } else {
                 println!("Invalid or empty URL (no image)");
+                println!("Error: {:?}", img);
 
                 txt_prompt += "\nUser: ";
             }

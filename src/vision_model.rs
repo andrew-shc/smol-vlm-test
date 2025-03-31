@@ -2,6 +2,7 @@
 #![allow(unused_attributes)] 
 
 
+use std::fs;
 use std::{collections::HashMap, error::Error};
 use candle_nn::{Conv2d, Conv2dConfig, Embedding, LayerNorm, Linear, Module};
 use candle_core::{DType, Device, Result, Shape, Tensor, D};
@@ -21,23 +22,31 @@ const STD: [f32; 3] = [0.229, 0.224, 0.225];
 
 
 pub fn load_image_url(url: &str) -> std::result::Result<DynamicImage, Box<dyn Error>> {
+    let dir = Path::new("static/images");
+
     // Generate a file name based on the URL (you can customize this to your needs)
-    let file_name = {
+    let file_path = {
         let parsed_url = reqwest::Url::parse(url)?;
         let path = parsed_url.path();
         
         // Extract the last part of the URL (the file name)
-        Path::new(path)
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("unknown_file.jpg") // Default name if URL doesn't have a file name
-            .to_string()
+        dir.join(
+            Path::new(path)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("unknown_file.jpg") // Default name if URL doesn't have a file name
+                .to_string()
+        )
     };
+
+    if !dir.exists() {
+        fs::create_dir(dir).unwrap();
+    }
     
     // Check if the file exists locally
-    if Path::new(&file_name).exists() {
+    if file_path.exists() {
         // If the file exists, load it from the local directory
-        let img = image::open(&file_name)?;
+        let img = image::open(&file_path)?;
         println!("Loaded image from local cache.");
         return Ok(img);
     }
@@ -54,9 +63,9 @@ pub fn load_image_url(url: &str) -> std::result::Result<DynamicImage, Box<dyn Er
         .decode()?;
 
     // Save the image to the local directory
-    img.save(&file_name)?;
+    img.save(&file_path)?;
 
-    println!("Saved image locally as {}", file_name);
+    println!("Saved image locally as {}", file_path.to_str().unwrap());
 
     // Return the image
     Ok(img)
@@ -327,8 +336,28 @@ impl MLP {
     //     todo!()
     // }
 
+    // Constants from PyTorch's GELU implementation
+    const SQRT_2_OVER_PI: f64 = 0.7978845608028654;  // sqrt(2.0 / PI)
+    const GELU_COEFF: f64 = 0.044715;
+
+    /// PyTorch-like GELU activation with `tanh` approximation.
+    pub fn gelu_tanh(input: &Tensor) -> Result<Tensor> {
+        let gelu_coeff = Tensor::new(Self::GELU_COEFF, input.device())?.to_dtype(DType::BF16)?;
+        let sqrt_2_over_pi = Tensor::new(Self::SQRT_2_OVER_PI, input.device())?.to_dtype(DType::BF16)?;
+        let one = Tensor::new(1.0, input.device())?.to_dtype(DType::BF16)?;
+        let half = Tensor::new(0.5, input.device())?.to_dtype(DType::BF16)?;
+
+        // Compute: 0.5 * x * (1 + tanh( sqrt(2/π) * (x + 0.044715 * x^3) ))
+        let x_cubed = input.powf(3.0)?;
+        let inner = (input + x_cubed.broadcast_mul(&gelu_coeff)?)?;
+        let tanh_arg = inner.broadcast_mul(&sqrt_2_over_pi)?;
+        let tanh = tanh_arg.tanh()?;
+
+        half.broadcast_mul(&input.broadcast_mul(&(tanh.broadcast_add(&one)?))?)
+    }
+
     pub fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        let x = self.fc1.forward(xs)?.gelu()?;  // python impl. uses gelo approximated with tanh
+        let x = Self::gelu_tanh(&self.fc1.forward(xs)?)?;  // python impl. uses gelo approximated with tanh
         self.fc2.forward(&x)
     }
 }
@@ -370,8 +399,8 @@ impl Block {
         let x = self.layer_norm1.forward(xs)?;
         let x = self.self_attn.forward(&x, attention_mask)?;
         let x = (residual+x)?;
-        let residual = x;
-        let x = self.layer_norm2.forward(xs)?;
+        let residual = &x;
+        let x = self.layer_norm2.forward(&x)?;
         let x = self.mlp.forward(&x);
         residual+x
     }
@@ -448,6 +477,10 @@ impl SmolVision {
                 (raw_ids * &patch_attention_masks)?
             };
             let position_embeddings = self.position_embedding.forward(&position_ids)?;
+            // println!("{:?}", patch_embeddings);
+            // println!("{:?}", position_embeddings);
+            // println!("{:?}", patch_embeddings.to_dtype(DType::F32)?.to_vec3::<f32>());
+            // println!("{:?}", position_embeddings.to_vec3::<u32>());
             patch_embeddings+position_embeddings
         }?;
         // println!(">> {:?}", hidden_states);
