@@ -140,10 +140,10 @@ pub fn preprocess_image(
     };
 
 
-    img.save("padded_img.png").unwrap();
-    mask.save("mask.png").unwrap();
-    global_img.save("global_padded_img.png").unwrap();
-    global_mask.save("global_mask.png").unwrap();
+    img.save("static/padded_img.png").unwrap();
+    mask.save("static/mask.png").unwrap();
+    global_img.save("static/global_padded_img.png").unwrap();
+    global_mask.save("static/global_mask.png").unwrap();
 
     let img = {
         let (width, height) = img.dimensions();
