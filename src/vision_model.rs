@@ -310,7 +310,7 @@ impl Attention {
             let att = candle_nn::ops::softmax_last_dim(&att)?;
             att.matmul(&v)?.contiguous()?.to_dtype(in_dtype)?
         };
-        let y = y.transpose(0, 1)?.reshape(&[batches, patches, hidden_size])?;
+        let y = y.transpose(1, 2)?.reshape(&[batches, patches, hidden_size])?;
         self.o_proj.forward(&y)
     }
 }

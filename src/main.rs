@@ -112,8 +112,8 @@ fn main() -> Result<()> {
     let mut lines_printed = 0;
     for i in 0..10_000 {
         if i == 0 || output == "<end_of_utterance>" {
-            /// https://res.cloudinary.com/enchanting/q_70,f_auto,w_5472,h_3078,c_fit/exodus-web/2023/05/mont-blanc.jpg
-            let img_url = read_input("img> ");
+            let img_url = String::from("https://res.cloudinary.com/enchanting/q_70,f_auto,w_5472,h_3078,c_fit/exodus-web/2023/05/mont-blanc.jpg");
+            // let img_url = read_input("img> ");
             let img = load_image_url(&img_url)
                 .and_then(
                     |v| if image.len() > 1 {
@@ -147,7 +147,7 @@ fn main() -> Result<()> {
         // print!("#");
         // io::stdout().flush().unwrap();
 
-        println!("{:?}", message);
+        // println!("{:?}", message);
         let encoding = tokenizer.encode(message.clone(), false).unwrap();
         let tokens = encoding.get_ids();
         

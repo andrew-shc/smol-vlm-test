@@ -290,6 +290,7 @@ impl SmolVLM {
         let mut c = 0;
         for (i, mask) in image_token_mask.to_vec1::<u8>()?.into_iter().enumerate() {
             merged_embeds.push(if mask != 0 {
+                // println!("{:?}", c);
                 c += 1;
                 image_hidden_states.i(c-1)?
             } else {
@@ -301,18 +302,6 @@ impl SmolVLM {
         let merged_embeds = Tensor::stack(&merged_embeds, 0)?;
 
         Ok(merged_embeds)
-
-        // let indices = Tensor::arange(0u32, total_length as u32, device)?
-        //     .mul(&image_token_mask.to_dtype(DType::U32)?)?;
-        // let scatter_indices = indices
-        //     .to_vec1::<u32>()?
-        //     .into_iter()
-        //     .filter(|&x| x != 0)
-        //     .collect::<Vec<u32>>();
-
-        // todo!();
-
-        // image_token_mask.where_cond(&image_embeds, inputs_embeds)
     }
 
     pub fn forward(
@@ -321,7 +310,7 @@ impl SmolVLM {
         let mut inputs_embeds = self.embed.forward(xs)?;
 
         if let Some((image_token_mask, pixel_values, pixel_attention_masks)) = vision_data {
-            println!("Vision...");
+            // println!("Vision...");
             let image_hidden_states = self.vision.forward(pixel_values, pixel_attention_masks, device)?;
             let image_hidden_states = self.connector.forward(&image_hidden_states)?;
     
@@ -333,7 +322,7 @@ impl SmolVLM {
             )?;
         }
 
-        println!("Language...");
+        // println!("Language...");
 
         let mut x = inputs_embeds; //self.inputs_merger(image_token_mask, &inputs_embeds, &image_hidden_states)?;
 
